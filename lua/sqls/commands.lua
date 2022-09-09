@@ -1,5 +1,6 @@
 local api = vim.api
 local fn = vim.fn
+local utils = require('sqls.utils')
 
 local nvim_exec_autocmds
 
@@ -22,9 +23,10 @@ local M = {}
 
 ---@alias sqls_lsp_handler fun(err?: table, result?: any, ctx: table, config: table)
 
----@param mods string
+---@param mods string?
+---@param start_time number?
 ---@return sqls_lsp_handler
-local function make_show_results_handler(mods)
+local function make_show_results_handler(mods, start_time)
     return function(err, result, _, _)
         if err then
             vim.notify('sqls: ' .. err.message, vim.log.levels.ERROR)
@@ -38,6 +40,10 @@ local function make_show_results_handler(mods)
         api.nvim_buf_set_lines(bufnr, 0, 1, false, vim.split(result, '\n'))
         vim.cmd(('%s pedit %s'):format(mods or '', tempfile))
         api.nvim_buf_set_option(bufnr, 'filetype', 'sqls_output')
+        if start_time ~= nil then
+            local elapsed = vim.loop.hrtime() - start_time
+            vim.notify(('sqls: %d rows in %.3f ms'):format(#vim.split(result, '\n'), elapsed / 1000000))
+        end
     end
 end
 
@@ -47,23 +53,31 @@ end
 ---@param show_vertical? '"-show-vertical"'
 ---@param line1? integer
 ---@param line2? integer
-function M.exec(command, mods, range_given, show_vertical, line1, line2)
+---@param on_cursor? boolean
+function M.exec(command, mods, range_given, show_vertical, line1, line2, on_cursor)
     local range
-    if range_given then
-        range = vim.lsp.util.make_given_range_params({line1, 0}, {line2, math.huge}).range
-        range['end'].character = range['end'].character - 1
+    if on_cursor then
+        local prev_semi_line, prev_semi_col = utils.get_prev_str_occurrence_from_buf(';')
+        local next_semi_line, next_semi_col = utils.get_next_str_occurrence_from_buf(';')
+        range = vim.lsp.util.make_given_range_params({ prev_semi_line, prev_semi_col }, { next_semi_line, next_semi_col })
+            .range
+    elseif range_given then
+        range = vim.lsp.util.make_given_range_params({ line1, 0 }, { line2, math.huge }).range
     end
+    range['end'].character = range['end'].character - 1
 
+    -- get current time to use to calculate elapsed time 
+    local start_time = vim.loop.hrtime()
     vim.lsp.buf_request(
         0,
         'workspace/executeCommand',
         {
             command = command,
-            arguments = {vim.uri_from_bufnr(0), show_vertical},
+            arguments = { vim.uri_from_bufnr(0), show_vertical },
             range = range,
         },
-        make_show_results_handler(mods)
-        )
+        make_show_results_handler(mods, start_time)
+    )
 end
 
 ---@alias sqls_operatorfunc fun(type: '"block"'|'"line"'|'"char"')
@@ -81,10 +95,10 @@ local function make_query_mapping(show_vertical)
         end
 
         if type == 'line' then
-            range = vim.lsp.util.make_given_range_params({lnum1, 0}, {lnum2, math.huge}).range
+            range = vim.lsp.util.make_given_range_params({ lnum1, 0 }, { lnum2, math.huge }).range
             range['end'].character = range['end'].character - 1
         elseif type == 'char' then
-            range = vim.lsp.util.make_given_range_params({lnum1, col1 - 1}, {lnum2, col2 - 1}).range
+            range = vim.lsp.util.make_given_range_params({ lnum1, col1 - 1 }, { lnum2, col2 - 1 }).range
         end
 
         vim.lsp.buf_request(
@@ -92,11 +106,11 @@ local function make_query_mapping(show_vertical)
             'workspace/executeCommand',
             {
                 command = 'executeQuery',
-                arguments = {vim.uri_from_bufnr(0), show_vertical},
+                arguments = { vim.uri_from_bufnr(0), show_vertical },
                 range = range,
             },
             make_show_results_handler('')
-            )
+        )
     end
 end
 
@@ -116,7 +130,7 @@ M.query_vertical = make_query_mapping('-show-vertical')
 local function make_choice_handler(switch_function, answer_formatter, event_name, query)
     return function(err, result, _, _)
         if err then
-            vim.notify('sqls: ' .. err.message, vim.log.levels.ERROR)
+            vim.notify('sqls: ' .. err.message, vim.log.levels.ERROR, query)
             return
         end
         if not result then
@@ -130,19 +144,20 @@ local function make_choice_handler(switch_function, answer_formatter, event_name
         local function switch_callback(answer)
             if not answer then return end
             switch_function(answer_formatter(answer))
-            require('sqls.events')._dispatch_event(event_name, {choice = answer})
+            require('sqls.events')._dispatch_event(event_name, { choice = answer })
             ---@diagnostic disable-next-line: redundant-parameter
             nvim_exec_autocmds('User', {
                 pattern = to_autocmd_event_name(event_name),
-                data = {choice = answer},
+                data = { choice = answer },
             })
         end
+
         if query then
             local answer = choices[tonumber(query)]
             switch_callback(answer)
             return
         end
-        vim.ui.select(choices, {prompt = 'sqls.nvim'}, switch_callback)
+        vim.ui.select(choices, { prompt = 'sqls.nvim' }, switch_callback)
     end
 end
 
@@ -162,10 +177,10 @@ local function make_switch_function(command)
             'workspace/executeCommand',
             {
                 command = command,
-                arguments = {query},
+                arguments = { query },
             },
             switch_handler
-            )
+        )
     end
 end
 
@@ -182,12 +197,13 @@ local function make_prompt_function(command, answer_formatter, event_name)
                 command = command,
             },
             make_choice_handler(switch_function, answer_formatter, event_name, query)
-            )
+        )
     end
 end
 
 ---@type sqls_answer_formatter
 local function format_database_answer(answer) return answer end
+
 ---@type sqls_answer_formatter
 local function format_connection_answer(answer) return vim.split(answer, ' ')[1] end
 
